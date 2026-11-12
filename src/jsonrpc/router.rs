@@ -344,6 +344,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn serializes_results_in_declared_field_order() {
+        let mut router: Router<Mock> = Router::new(Mock);
+        router.method("second", Mock::request_params, layer_fn(|s| s));
+
+        let params = json!({"foo": -123i32, "bar": "hello world"});
+        let request = Request::build("second")
+            .params(params.clone())
+            .id(1)
+            .finish();
+        let Ok(Some(response)) = router.ready().await.unwrap().call(request).await else {
+            panic!("expected a response");
+        };
+
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"jsonrpc":"2.0","result":{"foo":-123,"bar":"hello world"},"id":1}"#
+        );
+        assert_eq!(response.result(), Some(&params));
+        assert_eq!(response.into_parts(), (1.into(), Ok(params)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn routes_notifications() {
         let mut router: Router<Mock> = Router::new(Mock);
         router
