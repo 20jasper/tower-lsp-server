@@ -16,7 +16,6 @@ enum Kind {
     },
     /// An already serialized result, only ever produced by the router. The parsed form is built
     /// lazily for the accessors that expose a [`LspAny`].
-    #[serde(skip_deserializing)]
     OkRaw {
         result: Box<RawValue>,
         #[serde(skip)]
@@ -83,10 +82,7 @@ impl Response {
     pub fn into_parts(self) -> (Id, Result<LspAny>) {
         match self.kind {
             Kind::Ok { result } => (self.id, Ok(result)),
-            Kind::OkRaw { result, .. } => (
-                self.id,
-                serde_json::from_str(result.get()).map_err(|_| Error::internal_error()),
-            ),
+            Kind::OkRaw { result, .. } => (self.id, Ok(parse(&result))),
             Kind::Err { error } => (self.id, Err(error)),
         }
     }
@@ -110,9 +106,7 @@ impl Response {
     pub fn result(&self) -> Option<&LspAny> {
         match &self.kind {
             Kind::Ok { result } => Some(result),
-            Kind::OkRaw { result, parsed } => Some(
-                parsed.get_or_init(|| serde_json::from_str(result.get()).unwrap_or(LspAny::Null)),
-            ),
+            Kind::OkRaw { result, parsed } => Some(parsed.get_or_init(|| parse(result))),
             Kind::Err { .. } => None,
         }
     }
@@ -137,13 +131,16 @@ impl Response {
 
 impl PartialEq for Response {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-            && match (&self.kind, &other.kind) {
-                (Kind::Err { error: a }, Kind::Err { error: b }) => a == b,
-                (Kind::Err { .. }, _) | (_, Kind::Err { .. }) => false,
-                _ => self.result() == other.result(),
-            }
+        self.id == other.id && self.error() == other.error() && self.result() == other.result()
     }
+}
+
+/// Parses a result that `serde_json` has already serialized, which can be nested deeper than its
+/// default recursion limit.
+fn parse(raw: &RawValue) -> LspAny {
+    let mut de = serde_json::Deserializer::from_str(raw.get());
+    de.disable_recursion_limit();
+    LspAny::deserialize(&mut de).expect("serialized results are valid JSON")
 }
 
 impl Debug for Response {

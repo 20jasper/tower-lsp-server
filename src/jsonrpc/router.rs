@@ -311,6 +311,14 @@ mod tests {
             Ok(LspAny::Null)
         }
 
+        async fn deep(&self) -> Result<LspAny, Error> {
+            Ok(Self::nested())
+        }
+
+        fn nested() -> LspAny {
+            (0..200).fold(LspAny::Null, |inner, _| LspAny::Array(vec![inner]))
+        }
+
         async fn request_params(&self, params: Params) -> Result<Params, Error> {
             Ok(params)
         }
@@ -344,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn serializes_results_in_declared_field_order() {
+    async fn serializes_typed_results() {
         let mut router: Router<Mock> = Router::new(Mock);
         router.method("second", Mock::request_params, layer_fn(|s| s));
 
@@ -357,12 +365,26 @@ mod tests {
             panic!("expected a response");
         };
 
+        let text = serde_json::to_string(&response).unwrap();
         assert_eq!(
-            serde_json::to_string(&response).unwrap(),
-            r#"{"jsonrpc":"2.0","result":{"foo":-123,"bar":"hello world"},"id":1}"#
+            serde_json::from_str::<LspAny>(&text).unwrap(),
+            json!({"jsonrpc": "2.0", "result": params, "id": 1})
         );
-        assert_eq!(response.result(), Some(&params));
-        assert_eq!(response.into_parts(), (1.into(), Ok(params)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn returns_deeply_nested_results() {
+        let mut router: Router<Mock> = Router::new(Mock);
+        router.method("deep", Mock::deep, layer_fn(|s| s));
+
+        let request = Request::build("deep").id(1).finish();
+        let Ok(Some(response)) = router.ready().await.unwrap().call(request).await else {
+            panic!("expected a response");
+        };
+
+        let expected = Mock::nested();
+        assert_eq!(response.result(), Some(&expected));
+        assert_eq!(response.into_parts(), (1.into(), Ok(expected)));
     }
 
     #[tokio::test(flavor = "current_thread")]
