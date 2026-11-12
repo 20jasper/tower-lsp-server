@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 [Unreleased]: https://github.com/tower-lsp-community/tower-lsp-server/compare/v0.24.0-rc.1...HEAD
 
+### Changed
+
+- Serialize handler results once instead of through an intermediate `serde_json::Value`. `Response::result` is no longer `const`.
+
 ## [0.24.0-rc.1] - 2026-09-11
 
 [0.24.0-rc.1]: https://github.com/tower-lsp-community/tower-lsp-server/compare/v0.23.0...v0.24.0-rc.1

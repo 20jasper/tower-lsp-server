@@ -1,20 +1,34 @@
 use std::fmt::{self, Debug, Formatter};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use gen_lsp_types::LspAny;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use super::{Error, Id, Result, Version};
 
-#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum Kind {
-    Ok { result: LspAny },
-    Err { error: Error },
+    Ok {
+        result: LspAny,
+    },
+    /// An already serialized result, only ever produced by the router. The parsed form is built
+    /// lazily for the accessors that expose a [`LspAny`].
+    #[serde(skip_deserializing)]
+    OkRaw {
+        result: Box<RawValue>,
+        #[serde(skip)]
+        parsed: OnceLock<LspAny>,
+    },
+    Err {
+        error: Error,
+    },
 }
 
 /// A successful or failed JSON-RPC response.
-#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Response {
     jsonrpc: Version,
     #[serde(flatten)]
@@ -43,6 +57,18 @@ impl Response {
         }
     }
 
+    /// Creates a new successful response from a request ID and an already serialized result.
+    pub(crate) const fn from_raw_ok(id: Id, result: Box<RawValue>) -> Self {
+        Self {
+            jsonrpc: Version,
+            kind: Kind::OkRaw {
+                result,
+                parsed: OnceLock::new(),
+            },
+            id,
+        }
+    }
+
     /// Creates a new response from a request ID and either an `Ok(Value)` or `Err(Error)` body.
     #[must_use]
     pub fn from_parts(id: Id, body: Result<LspAny>) -> Self {
@@ -57,6 +83,10 @@ impl Response {
     pub fn into_parts(self) -> (Id, Result<LspAny>) {
         match self.kind {
             Kind::Ok { result } => (self.id, Ok(result)),
+            Kind::OkRaw { result, .. } => (
+                self.id,
+                serde_json::from_str(result.get()).map_err(|_| Error::internal_error()),
+            ),
             Kind::Err { error } => (self.id, Err(error)),
         }
     }
@@ -64,7 +94,7 @@ impl Response {
     /// Returns `true` if the response indicates success.
     #[must_use]
     pub const fn is_ok(&self) -> bool {
-        matches!(self.kind, Kind::Ok { .. })
+        matches!(self.kind, Kind::Ok { .. } | Kind::OkRaw { .. })
     }
 
     /// Returns `true` if the response indicates failure.
@@ -77,9 +107,12 @@ impl Response {
     ///
     /// This member only exists if the response indicates success.
     #[must_use]
-    pub const fn result(&self) -> Option<&LspAny> {
+    pub fn result(&self) -> Option<&LspAny> {
         match &self.kind {
             Kind::Ok { result } => Some(result),
+            Kind::OkRaw { result, parsed } => Some(
+                parsed.get_or_init(|| serde_json::from_str(result.get()).unwrap_or(LspAny::Null)),
+            ),
             Kind::Err { .. } => None,
         }
     }
@@ -91,7 +124,7 @@ impl Response {
     pub const fn error(&self) -> Option<&Error> {
         match &self.kind {
             Kind::Err { error } => Some(error),
-            Kind::Ok { .. } => None,
+            Kind::Ok { .. } | Kind::OkRaw { .. } => None,
         }
     }
 
@@ -102,6 +135,17 @@ impl Response {
     }
 }
 
+impl PartialEq for Response {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && match (&self.kind, &other.kind) {
+                (Kind::Err { error: a }, Kind::Err { error: b }) => a == b,
+                (Kind::Err { .. }, _) | (_, Kind::Err { .. }) => false,
+                _ => self.result() == other.result(),
+            }
+    }
+}
+
 impl Debug for Response {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let mut d = f.debug_struct("Response");
@@ -109,6 +153,7 @@ impl Debug for Response {
 
         match &self.kind {
             Kind::Ok { result } => d.field("result", result),
+            Kind::OkRaw { result, .. } => d.field("result", result),
             Kind::Err { error } => d.field("error", error),
         };
 
@@ -121,5 +166,59 @@ impl FromStr for Response {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         serde_json::from_str(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn raw(value: &LspAny) -> Box<RawValue> {
+        serde_json::value::to_raw_value(value).unwrap()
+    }
+
+    #[test]
+    fn raw_response_serializes_verbatim() {
+        let response = Response::from_raw_ok(1.into(), raw(&json!({"a": [1, null]})));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"jsonrpc":"2.0","result":{"a":[1,null]},"id":1}"#
+        );
+    }
+
+    #[test]
+    fn raw_response_serializes_nested_and_escaped_verbatim() {
+        let text = r#"{"a":[{"b":"q\"\\\n\u00e9"},[],{}],"c":null}"#;
+        let result = RawValue::from_string(text.to_owned()).unwrap();
+        let response = Response::from_raw_ok("x".to_owned().into(), result);
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            format!(r#"{{"jsonrpc":"2.0","result":{text},"id":"x"}}"#)
+        );
+    }
+
+    #[test]
+    fn raw_response_matches_value_response() {
+        let value = json!({"a": [1, null]});
+        let raw_response = Response::from_raw_ok(1.into(), raw(&value));
+        let ok = Response::from_ok(1.into(), value.clone());
+
+        assert_eq!(raw_response, ok);
+        assert_eq!(ok, raw_response);
+        assert_ne!(raw_response, Response::from_ok(1.into(), json!(null)));
+        assert_eq!(raw_response.result(), Some(&value));
+        assert_eq!(
+            serde_json::to_string(&raw_response).unwrap(),
+            serde_json::to_string(&ok).unwrap()
+        );
+
+        let round_trip: Response = serde_json::to_string(&raw_response)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(round_trip, raw_response);
+        assert_eq!(raw_response.into_parts(), (1.into(), Ok(value)));
     }
 }

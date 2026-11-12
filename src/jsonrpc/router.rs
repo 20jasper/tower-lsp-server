@@ -264,13 +264,16 @@ impl<R: Serialize + Send + 'static> IntoResponse for Result<R, Error> {
         debug_assert!(id.is_some(), "Requests always contain an `id` field");
         id.map(|id| {
             let result = self.and_then(|r| {
-                serde_json::to_value(r).map_err(|e| Error {
+                serde_json::value::to_raw_value(&r).map_err(|e| Error {
                     code: ErrorCode::InternalError,
                     message: e.to_string().into(),
                     data: None,
                 })
             });
-            Response::from_parts(id, result)
+            match result {
+                Ok(result) => Response::from_raw_ok(id, result),
+                Err(error) => Response::from_error(id, error),
+            }
         })
     }
 
